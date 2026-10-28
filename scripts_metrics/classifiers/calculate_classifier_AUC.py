@@ -79,7 +79,7 @@ np.random.seed(args.seed)
 device = "cuda" if torch.cuda.is_available() else "cpu"
  
 # ---- load data --
-_, ref, alt = load_pairs("../../runs/alphagenome/expression_ag/embeddings_expression_ag.pkl")
+_, ref, alt = load_pairs("../../runs/dnabert2/n_test/embeddings_n_test_n128.pkl")
 #ref = load_emb("../../embeddings/ref_embeddings_disease_hyena_large_512.pkl")
 #alt = load_emb("../../embeddings/alt_embeddings_disease_hyena_large_512.pkl")
 label_df = pd.read_csv("../../data/variant_effects/variant_effects_expression.bed", sep="\t")
@@ -89,9 +89,9 @@ assert ref.shape == alt.shape and len(ref) == len(label_df), (
     f"ref={ref.shape} alt={alt.shape} labels={len(label_df)}"
 )
 
-#X= (ref-alt).astype(np.float32)
+X= (ref-alt).astype(np.float32)
 #X = ((alt + ref)/2).astype(np.float32)
-X = np.concatenate([ref, alt], axis=1).astype(np.float32)
+#X = np.concatenate([ref, alt], axis=1).astype(np.float32)
 y_raw = label_df[LABEL_COL].values
 
 classes, y = np.unique(y_raw, return_inverse=True)

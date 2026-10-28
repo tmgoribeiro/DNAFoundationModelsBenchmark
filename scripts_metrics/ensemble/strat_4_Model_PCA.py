@@ -8,6 +8,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score
 import pickle
 from tqdm import tqdm
+from sklearn.decomposition import PCA
 
 def load_emb(path):
     with open(path, "rb") as f:
@@ -79,42 +80,54 @@ np.random.seed(args.seed)
 device = "cuda" if torch.cuda.is_available() else "cpu"
  
 # ---- load data --
-_, ref, alt = load_pairs("../../runs/alphagenome/expression_ag/embeddings_expression_ag.pkl")
-#ref = load_emb("../../embeddings/ref_embeddings_disease_hyena_large_512.pkl")
-#alt = load_emb("../../embeddings/alt_embeddings_disease_hyena_large_512.pkl")
+_, dnabert2_ref, dnabert2_alt = load_pairs("../../runs/dnabert2/expression_dnabert2/embeddings_expression_dnabert2.pkl")
+_, grover_ref, grover_alt = load_pairs("../../runs/grover/expression_grover/embeddings_expression_grover.pkl")
+_, hyenadna_ref, hyenadna_alt = load_pairs("../../runs/hyenadna/expression_hyenadna/embeddings_expression_hyenadna.pkl")
+_, ag_ref, ag_alt = load_pairs("../../runs/alphagenome/expression_ag/embeddings_expression_ag.pkl")
+
+dnabert2_X= (dnabert2_ref-dnabert2_alt).astype(np.float32)
+grover_X= (grover_ref-grover_alt).astype(np.float32)
+hyenadna_X= (hyenadna_ref-hyenadna_alt).astype(np.float32)
+ag_X= (ag_ref-ag_alt).astype(np.float32)
+
+feats = {
+    #"dnabert2": dnabert2_X,
+    #"grover": grover_X,
+    "hyena": hyenadna_X,
+    "ag": ag_X,
+}
+
 label_df = pd.read_csv("../../data/variant_effects/variant_effects_expression.bed", sep="\t")
 LABEL_COL = "label"  # adjust to the label column name in the .bed
-
-assert ref.shape == alt.shape and len(ref) == len(label_df), (
-    f"ref={ref.shape} alt={alt.shape} labels={len(label_df)}"
-)
-
-#X= (ref-alt).astype(np.float32)
-#X = ((alt + ref)/2).astype(np.float32)
-X = np.concatenate([ref, alt], axis=1).astype(np.float32)
 y_raw = label_df[LABEL_COL].values
 
 classes, y = np.unique(y_raw, return_inverse=True)
 n_classes = len(classes)
-print(f"X: {X.shape} | classes: {n_classes} {dict(zip(classes, np.bincount(y)))} | device: {device}")
- 
+#print(f"X: {X.shape} | classes: {n_classes} {dict(zip(classes, np.bincount(y)))} | device: {device}")
  
  
 skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
 aucs = []
  
-for fold, (tr, te) in enumerate(skf.split(X, y), 1):
-    # scale on train only (no leakage)
-    scaler = StandardScaler().fit(X[tr])
-    X_tr = torch.tensor(scaler.transform(X[tr]), dtype=torch.float32, device=device)
-    X_te = torch.tensor(scaler.transform(X[te]), dtype=torch.float32, device=device)
+for fold, (tr, te) in enumerate(skf.split(dnabert2_X, y), 1):
+
+    tr_blocks, te_blocks = [], []
+    for Xm in feats.values():
+        sc = StandardScaler().fit(Xm[tr])
+        Xtr_s, Xte_s = sc.transform(Xm[tr]), sc.transform(Xm[te])
+        pca = PCA(n_components=128, svd_solver="randomized", random_state=args.seed).fit(Xtr_s)
+        tr_blocks.append(pca.transform(Xtr_s))
+        te_blocks.append(pca.transform(Xte_s))
+
+    X_tr = torch.from_numpy(np.concatenate(tr_blocks, axis=1)).float().to(device)
+    X_te = torch.from_numpy(np.concatenate(te_blocks, axis=1)).float().to(device)
 
     y_dtype = torch.float32 if n_classes == 2 else torch.long
     y_tr = torch.tensor(y[tr], dtype=y_dtype, device=device)
     y_te = torch.tensor(y[te], dtype=y_dtype, device=device)
     loss_fn = nn.BCEWithLogitsLoss() if n_classes == 2 else nn.CrossEntropyLoss()
 
-    model = make_model(X.shape[1], n_classes).to(device)
+    model = make_model(X_tr.shape[1], n_classes).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     if not args.random:

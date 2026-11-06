@@ -4,9 +4,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.metrics import roc_auc_score, average_precision_score
 import pickle
+import time
+from datetime import datetime
+from pathlib import Path
 from tqdm import tqdm
 from sklearn.decomposition import PCA
 
@@ -60,6 +63,27 @@ def auc(y_true, probs):
     if n_classes == 2:
         return roc_auc_score(y_true, probs)
     return roc_auc_score(y_true, probs, multi_class="ovr", average="macro")
+
+
+def aupr(y_true, probs):
+    if n_classes == 2:
+        return average_precision_score(y_true, probs)
+    return average_precision_score(label_binarize(y_true, classes=np.arange(n_classes)), probs, average="macro")
+
+
+def now():
+    # the GPU runs asynchronously, so wait for it before reading the clock
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def peak_ram_gb():
+    try:
+        import resource  # not available on Windows
+    except ImportError:
+        return float("nan")
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
  
 
 
@@ -73,29 +97,27 @@ p.add_argument("--layers", type=int, default=1)
 p.add_argument("--dropout", type=int, default=0.1)
 p.add_argument("--seed", type=int, default=42)
 p.add_argument("--random", action="store_true", help="skip training: randomly initialised model")
+p.add_argument("--models", nargs="+", choices=["dnabert2", "grover", "hyena", "ag"], default=["dnabert2", "grover", "hyena", "ag"], help="models to concatenate")
 args = p.parse_args()
  
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 device = "cuda" if torch.cuda.is_available() else "cpu"
  
+start = now()
+
 # ---- load data --
-_, dnabert2_ref, dnabert2_alt = load_pairs("../../runs/dnabert2/expression_dnabert2/embeddings_expression_dnabert2.pkl")
-_, grover_ref, grover_alt = load_pairs("../../runs/grover/expression_grover/embeddings_expression_grover.pkl")
-_, hyenadna_ref, hyenadna_alt = load_pairs("../../runs/hyenadna/expression_hyenadna/embeddings_expression_hyenadna.pkl")
-_, ag_ref, ag_alt = load_pairs("../../runs/alphagenome/expression_ag/embeddings_expression_ag.pkl")
-
-dnabert2_X= (dnabert2_ref-dnabert2_alt).astype(np.float32)
-grover_X= (grover_ref-grover_alt).astype(np.float32)
-hyenadna_X= (hyenadna_ref-hyenadna_alt).astype(np.float32)
-ag_X= (ag_ref-ag_alt).astype(np.float32)
-
-feats = {
-    "dnabert2": dnabert2_X,
-    "grover": grover_X,
-    "hyena": hyenadna_X,
-    "ag": ag_X,
+paths = {
+    "dnabert2": "../../runs/dnabert2/expression_dnabert2/embeddings_expression_dnabert2.pkl",
+    "grover": "../../runs/grover/expression_grover/embeddings_expression_grover.pkl",
+    "hyena": "../../runs/hyenadna/expression_hyenadna/embeddings_expression_hyenadna.pkl",
+    "ag": "../../runs/alphagenome/expression_ag/embeddings_expression_ag.pkl",
 }
+
+feats = {}
+for name in args.models:
+    _, ref, alt = load_pairs(paths[name])
+    feats[name] = (ref - alt).astype(np.float32)
 
 label_df = pd.read_csv("../../data/variant_effects/variant_effects_expression.bed", sep="\t")
 LABEL_COL = "label"  # adjust to the label column name in the .bed
@@ -106,10 +128,13 @@ n_classes = len(classes)
 #print(f"X: {X.shape} | classes: {n_classes} {dict(zip(classes, np.bincount(y)))} | device: {device}")
  
  
+load_time = now() - start
+
 skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
-aucs = []
+aucs, auprs, pca_times, train_times, predict_times = [], [], [], [], []
  
-for fold, (tr, te) in enumerate(skf.split(dnabert2_X, y), 1):
+for fold, (tr, te) in enumerate(skf.split(feats[args.models[0]], y), 1):
+    fold_start = now()
 
     tr_blocks, te_blocks = [], []
     for Xm in feats.values():
@@ -136,6 +161,8 @@ for fold, (tr, te) in enumerate(skf.split(dnabert2_X, y), 1):
     del Xc_tr_t, Xc_te_t, U, S, V
     torch.cuda.empty_cache()
 
+    pca_times.append(now() - fold_start)
+    print(f"Fold {fold} | models: {args.models} | X: {tuple(X_tr.shape)}")
     y_dtype = torch.float32 if n_classes == 2 else torch.long
     y_tr = torch.tensor(y[tr], dtype=y_dtype, device=device)
     y_te = torch.tensor(y[te], dtype=y_dtype, device=device)
@@ -144,6 +171,7 @@ for fold, (tr, te) in enumerate(skf.split(dnabert2_X, y), 1):
     model = make_model(X_tr.shape[1], n_classes).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
+    train_start = now()
     if not args.random:
         n = len(X_tr)
         for epoch in range(1, args.epochs + 1):
@@ -162,6 +190,8 @@ for fold, (tr, te) in enumerate(skf.split(dnabert2_X, y), 1):
                 steps += 1
             print(f"Fold {fold} | epoch {epoch:3d} | train loss = {running.item() / steps:.4f}")
 
+    train_times.append(now() - train_start)
+
     # validation loss on the held-out fold
     model.eval()
     with torch.no_grad():
@@ -169,8 +199,43 @@ for fold, (tr, te) in enumerate(skf.split(dnabert2_X, y), 1):
         val_out = val_out.squeeze(1) if n_classes == 2 else val_out
         val_loss = loss_fn(val_out, y_te).item()
 
-    fold_auc = auc(y[te], predict_proba(model, X_te))
+    predict_start = now()
+    probs = predict_proba(model, X_te)
+    predict_times.append(now() - predict_start)
+    fold_auc = auc(y[te], probs)
+    fold_aupr = aupr(y[te], probs)
     aucs.append(fold_auc)
-    print(f"Fold {fold}: AUC = {fold_auc:.4f} | val loss = {val_loss:.4f}\n")
+    auprs.append(fold_aupr)
+    print(f"Fold {fold}: AUC = {fold_auc:.4f} | AUPR = {fold_aupr:.4f} | val loss = {val_loss:.4f} | "
+          f"pca {pca_times[-1]:.1f}s | train {train_times[-1]:.1f}s | predict {predict_times[-1]:.3f}s\n")
  
+elapsed = now() - start
+chance_aupr = y.mean() if n_classes == 2 else 1 / n_classes
+peak_gpu = torch.cuda.max_memory_allocated() / 1024**3 if device == "cuda" else float("nan")
+
 print(f"\nMean AUC: {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
+print(f"Mean AUPR: {np.mean(auprs):.4f} ± {np.std(auprs):.4f} | AUPR by chance: {chance_aupr:.4f} | positive class: {classes[-1]}")
+print(f"Time: total {elapsed:.1f}s | load {load_time:.1f}s | per fold: pca {np.mean(pca_times):.1f}s, train {np.mean(train_times):.1f}s, predict {np.mean(predict_times):.3f}s")
+print(f"Peak memory: GPU {peak_gpu:.2f} GB | RAM {peak_ram_gb():.2f} GB | device: {device}")
+
+log_dir = Path("../../runs/ensemble")
+log_dir.mkdir(parents=True, exist_ok=True)
+with open(log_dir / "log.txt", "a") as log_f:
+    log_f.write(
+        f"{datetime.now():%Y-%m-%d %H:%M:%S} | "
+        f"script={Path(__file__).stem} | "
+        f"models={'+'.join(args.models)} | "
+        f"X_dim={X_tr.shape[1]} | "
+        f"n_variants={len(y)} | "
+        f"AUC={np.mean(aucs):.4f}+-{np.std(aucs):.4f} | "
+        f"AUPR={np.mean(auprs):.4f}+-{np.std(auprs):.4f} | "
+        f"chance_AUPR={chance_aupr:.4f} | "
+        f"elapsed={elapsed:.1f}s | "
+        f"load={load_time:.1f}s | "
+        f"pca_per_fold={np.mean(pca_times):.1f}s | "
+        f"train_per_fold={np.mean(train_times):.1f}s | "
+        f"predict_per_fold={np.mean(predict_times):.3f}s | "
+        f"peak_gpu={peak_gpu:.2f}GB | "
+        f"peak_ram={peak_ram_gb():.2f}GB | "
+        f"device={device}\n"
+    )

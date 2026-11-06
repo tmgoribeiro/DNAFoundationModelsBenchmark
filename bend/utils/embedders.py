@@ -1582,3 +1582,107 @@ class AlphaGenomeEmbedder(BaseEmbedder):
         return embeddings
     
 
+class BorzoiEmbedder(BaseEmbedder):
+    '''Embed using the Borzoi model https://doi.org/10.1038/s41588-024-02053-6'''
+
+    def load_model(self, model_name: str = 'johahi/borzoi-replicate-0', **kwargs):
+        """
+        Load the Borzoi model.
+
+        Parameters
+        ----------
+        model_name : str, optional
+            The name of the model to load. Defaults to "johahi/borzoi-replicate-0".
+            When providing a name, the model will be loaded from the HuggingFace model hub.
+            Alternatively, you can provide a path to a local model directory.
+
+        Raises
+        ------
+        ModuleNotFoundError
+            If the borzoi_pytorch module is not installed.
+        ImportError
+            If the installed borzoi_pytorch module is older than 0.5.0.
+
+        Notes
+        -----
+        The borzoi_pytorch module can be installed with `pip install --no-deps "borzoi-pytorch>=0.5.0" intervaltree sortedcontainers`.
+        Without --no-deps, pip upgrades transformers to a version that breaks the import of bend.models.gena_lm.
+        """
+        try:
+            from borzoi_pytorch import Borzoi
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError('Borzoi requires borzoi-pytorch. Install with: pip install --no-deps "borzoi-pytorch>=0.5.0" intervaltree sortedcontainers')
+
+        # Before 0.5.0 the relative positions of the attention layers are fixed to the 524 kb training input,
+        # which silently gives wrong attention for shorter sequences.
+        from importlib import metadata
+        from packaging import version
+        if version.parse(metadata.version('borzoi-pytorch')) < version.parse('0.5.0'):
+            raise ImportError('Borzoi requires borzoi-pytorch>=0.5.0. Install with: pip install --no-deps "borzoi-pytorch>=0.5.0" intervaltree sortedcontainers')
+
+        self.model = Borzoi.from_pretrained(model_name)
+        # The crop keeps the central 6144 bins of the 524 kb training input and raises an error for shorter sequences.
+        # A target length of -1 disables it, so that we get one embedding for every bin of the input.
+        self.model.crop.target_length = -1
+        self.model.to(device)
+        self.model.eval()
+
+        self.max_length = 524288 # nucleotides, the input length Borzoi was trained on.
+        self.bin_size = 32 # nucleotides represented by each embedding vector.
+        self.length_multiple = 128 # the U-Net pools 7 times, so the input length has to be a multiple of 2**7.
+        self.encoder = EncodeSequence() # A, C, G, N, T
+
+    def embed(self, sequences: List[str], disable_tqdm: bool = False, remove_special_tokens: bool = True, upsample_embeddings: bool = False):
+        """
+        Embed sequences using the Borzoi model.
+
+        Parameters
+        ----------
+        sequences : List[str]
+            List of sequences to embed.
+        disable_tqdm : bool, optional
+            Whether to disable the tqdm progress bar. Defaults to False.
+        remove_special_tokens : bool, optional
+            Only provided for compatibility with other embedders. Borzoi does not use special tokens.
+        upsample_embeddings : bool, optional
+            Whether to upsample the embeddings to the length of the input sequence. Defaults to False.
+            Borzoi returns one embedding vector per 32 bp bin, so upsampling repeats each vector 32 times.
+
+        Returns
+        -------
+        List[np.ndarray]
+            List of embeddings of shape (1, length, 1920), taken from the layer right before the output heads.
+            The length is len(sequence) if upsample_embeddings is True, and ceil(len(sequence) / 32) otherwise.
+        """
+        embeddings = []
+        with torch.inference_mode():
+            for s in tqdm(sequences, disable=disable_tqdm):
+                chunks = [s[chunk : chunk + self.max_length] for chunk in range(0, len(s), self.max_length)] # split into chunks
+                embedded_chunks = []
+                for chunk in chunks:
+                    # (1, 4, length) in A, C, G, T order. Dropping the N column encodes N as all zeros.
+                    dna_onehot = self.encoder.transform_integer(sequence=chunk.upper(), return_onehot=True)[:, [0, 1, 2, 4]]
+                    dna_onehot = torch.tensor(dna_onehot, dtype=torch.float32).T.unsqueeze(0).to(device)
+
+                    # pad with Ns up to the next valid length. The bins that only cover padding are removed below.
+                    dna_onehot = torch.nn.functional.pad(dna_onehot, (0, -len(chunk) % self.length_multiple))
+
+                    # The attention layers cache the relative positions of the first input they see and
+                    # assume that length from then on, so they have to be recomputed for each input.
+                    for module in self.model.modules():
+                        if hasattr(module, 'positions'):
+                            module.positions = None
+
+                    output = self.model.final_joined_convs(self.model.get_embs_after_crop(dna_onehot))
+                    output = output.permute(0, 2, 1).cpu().numpy() # (1, bins, 1920)
+                    output = output[:, :math.ceil(len(chunk) / self.bin_size)]
+
+                    if upsample_embeddings:
+                        output = np.repeat(output, self.bin_size, axis=1)[:, :len(chunk)]
+
+                    embedded_chunks.append(output)
+
+                embedding = np.concatenate(embedded_chunks, axis=1)
+                embeddings.append(embedding)
+
+        return embeddings

@@ -77,6 +77,7 @@ Some of the embedders currently also support computing logits and cross entropy 
 |[DNABert2Embedder](https://bend.readthedocs.io/en/latest/bend.utils.embedders.html#bend.utils.embedders.DNABert2Embedder) | [Zhou et al.](https://arxiv.org/pdf/2306.15006v1.pdf) | [1 model available](https://huggingface.co/zhihan1996/DNABERT-2-117M) | |
 |[GROVEREmbedder](https://bend.readthedocs.io/en/latest/bend.utils.embedders.html#bend.utils.embedders.GROVEREmbedder) | [Sanabria et al.](https://www.nature.com/articles/s42256-024-00872-0) | [1 model available](https://zenodo.org/records/8373117) | The original BPE tokenizer is not available, so we apply MaxMatch for segmentation of the input sequence into tokens.|
 |[CaduceusEmbedder](https://bend.readthedocs.io/en/latest/bend.utils.embedders.html#bend.utils.embedders.CaduceusEmbedder) | [Schiff et al.](https://arxiv.org/abs/2403.03234) | [2 different models available](https://github.com/kuleshov-group/caduceus/) | Requires `mamba-ssm==1.2.0.post1` to be installed in the environment. |
+|[BorzoiEmbedder](https://bend.readthedocs.io/en/latest/bend.utils.embedders.html#bend.utils.embedders.BorzoiEmbedder) | [Linder et al.](https://doi.org/10.1038/s41588-024-02053-6) | [4 replicates available](https://huggingface.co/johahi/borzoi-replicate-0) | Requires `pip install --no-deps "borzoi-pytorch>=0.5.0" intervaltree sortedcontainers` (without `--no-deps`, pip upgrades `transformers` to a version that breaks GENA-LM). Returns one embedding vector per 32 bp bin. |
 
 All embedders can be used as follows:
 ```python
@@ -345,4 +346,5 @@ Model | Upsampling strategy
 DNABert | The overlapping k-mer tokenization strategy of DNABert causes some "missing embeddings" at the start and the end of the input sequence, as there is no context to build the k-mer tokens from. For `k=3`, we repeat the first and the last embedding vectors once. For `k=4`, we repeat the first once and the last twice. For `k=5`, we repeat the first and the last twice. For `k=6`, we repeat the first twice and the last three times. 
 Nucleotide Transformer | Due to 6-mer tokenization, each embedding is repeated 6 times. Remainder tokens are single nucleotides and left as-is.
 GENA-LM, DNABERT-2, GROVER | BPE tokens have variable length. We repeat each embedding vector to the length of the sequence represented by its token.
+Borzoi | The model returns one embedding vector per 32 bp bin. We repeat each embedding vector 32 times, and trim the end if the sequence length is not a multiple of 32.
 
